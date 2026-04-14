@@ -18,7 +18,7 @@ wifi:
 api:
   encryption:
     key: !secret encryption_key
-  reboot_timeout: 
+  reboot_timeout:
     minutes: 10
 
 ota:
@@ -30,6 +30,8 @@ logger:
   baud_rate: 0
 
 debug:
+
+captive_portal:
 
 i2c:
   - id: bus_a
@@ -50,9 +52,53 @@ text_sensor:
       name: "Garage door multi sensor IP address"
     ssid:
       name: "Garage door multi sensor connected SSID"
-  - platform: homeassistant
-    entity_id: input_select.garage_motor_last_direction
-    id: motor_direction
+  - platform: template
+    name: "Internal Last Direction"
+    icon: "mdi:arrow-up-down"
+    lambda: |-
+      if (id(was_opening)) return {"Was Opening"};
+      else return {"Was Closing"};
+    update_interval: 1s
+
+  - platform: template
+    name: "Garage Raw Movement Debug"
+    id: garage_debug_status
+    icon: "mdi:bug"
+    update_interval: 0.05s
+    lambda: |-
+      static float last_raw_val = -1.0;
+      float current_raw_val = id(rotary_raw).state;
+      
+      if (last_raw_val == -1.0) {
+        last_raw_val = current_raw_val;
+        return {"Initializing"};
+      }
+
+      // Calculate the raw jump of the magnet
+      float diff = current_raw_val - last_raw_val;
+      if (diff > 2048.0f) diff -= 4096.0f;
+      else if (diff < -2048.0f) diff += 4096.0f;
+      
+      last_raw_val = current_raw_val;
+
+      // Check for hard limits first
+      if (!id(door_closed_reed).state) return {"Physically Closed"};
+      if (id(door_open_reed).state) return {"Physically Open"};
+
+      // Threshold of 5.0 to ignore electrical noise
+      if (std::abs(diff) < 5.0f) {
+        return {"Stationary"};
+      }
+
+      // DIRECTION TRUTH:
+      // Based on your calibration: 
+      // Negative diff = Magnet turning "Upward" (Toward Peak)
+      // Positive diff = Magnet turning "Downward" (Toward Floor)
+      if (diff < 0) {
+        return {"Magnet Spinning UP"};
+      } else {
+        return {"Magnet Spinning DOWN"};
+      }
 
 button:
   - platform: restart
@@ -61,11 +107,8 @@ button:
 globals:
   - id: total_steps
     type: float
-    restore_value: no
+    restore_value: yes
     initial_value: '0'
-  - id: peak_steps
-    type: float
-    initial_value: '24500.0'
   - id: manual_override
     type: bool
     initial_value: 'false'
@@ -75,7 +118,11 @@ globals:
   - id: coasting_lock
     type: bool
     initial_value: 'false'
-    
+  - id: was_opening
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
 sensor:
   # WiFi Signal & System Sensors
   - platform: wifi_signal
@@ -90,30 +137,30 @@ sensor:
 
   # AS5600 RAW DATA to Home Assistant
   - platform: as5600
-    name: "AS5600 Raw Value"
-    as5600_id: as5600_hub
-    update_interval: 0.1s
     id: rotary_raw
+    as5600_id: as5600_hub
+    update_interval: 0.01s
 
+  # SHAFT STEPS SENSOR
   - platform: template
     name: "Shaft Steps"
     id: shaft_steps
     unit_of_measurement: "steps"
     accuracy_decimals: 0
-    update_interval: 0.1s
+    update_interval: 0.01s
     icon: "mdi:counter"
     lambda: |-
       // 1. HARDWARE LOCKS
       // Force 0 if closed reed is active
-      if (id(door_closed_reed).state) {
+      if (!id(door_closed_reed).state) {
         id(total_steps) = 0.0f;
         return 0.0f;
       }
       
       // Force Peak only if not ignoring (not just started closing)
       if (id(door_open_reed).state && !id(ignore_open_reed)) {
-        id(total_steps) = 24500.0f;
-        return 24500.0f;
+        id(total_steps) = 25300.0f;
+        return 25300.0f;
       }
 
       static float last_raw = -1.0;
@@ -139,13 +186,20 @@ sensor:
       if (diff > 2048.0f) diff -= 4096.0f;
       else if (diff < -2048.0f) diff += 4096.0f;
 
-      // Jitter filter (10.0f handles your midway noise)
-      if (std::abs(diff) < 10.0f) return id(total_steps);
+      // Jitter filter (5.0f handles your midway noise)
+      if (std::abs(diff) < 5.0f) return id(total_steps);
 
       // --- 2. SMART ZONE MATH (The Fix) ---
-      // 0 - 22000: Trust physical magnet rotation.
-      // 22000+: Force directionality to prevent "backward" drift at the curve.
-      bool in_danger_zone = (id(total_steps) > 22000.0f);
+      // 0 - 23500: Trust physical magnet rotation.
+      // 23500+: Force directionality to prevent "backward" drift at the curve.
+      bool in_danger_zone = (id(total_steps) > 23500.0f);
+
+      // --- AUTO-UPDATE WAS_OPENING ---
+      // If we aren't in the danger zone, trust the magnet to tell us the direction
+      if (!in_danger_zone) {
+        if (diff < 0) id(was_opening) = true;   // Magnet spinning UP
+        else if (diff > 0) id(was_opening) = false; // Magnet spinning DOWN
+      }
 
       if (id(garage_door_cover).current_operation == COVER_OPERATION_OPENING) {
         // In upper zone, use abs(diff) because shaft spins "backwards" relative to door.
@@ -176,9 +230,9 @@ sensor:
             last_pos = current_pos;
 
             // Speed threshold for state publishing
-            if (std::abs(speed) >= 12.0f) {
+            if (std::abs(speed) >= 5.0f) {
                 idle_counter = 0; 
-                if (!id(door_closed_reed).state && !id(door_open_reed).state) {
+                if (id(door_closed_reed).state && !id(door_open_reed).state) {
                     auto new_op = (speed > 0) ? COVER_OPERATION_OPENING : COVER_OPERATION_CLOSING;
                     if (id(garage_door_cover).current_operation != new_op) {
                         id(garage_door_cover).current_operation = new_op;
@@ -188,23 +242,26 @@ sensor:
             } else {
                 idle_counter++;
                 // Stop operation if no significant movement for 0.5s
-                if (idle_counter > 5 && id(garage_door_cover).current_operation != COVER_OPERATION_IDLE) {
+                if (idle_counter > 50 && id(garage_door_cover).current_operation != COVER_OPERATION_IDLE) {
                     id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
                     id(garage_door_cover).publish_state();
                 }
             }
-            
+
 binary_sensor:
   # 1. CLOSED REED (Imported via HA)
   - platform: homeassistant
     entity_id: binary_sensor.garage_door_input
     id: door_closed_reed
+    name: "Garage Door Closed Status"
+    internal: false
     filters:
-      - delayed_on: 1s 
+      - invert:
+    device_class: garage_door
     on_state:
       then:
         - if:
-            condition: { lambda: 'return x;' }
+            condition: { lambda: 'return !x;' }
             then:
               - lambda: |-
                   id(total_steps) = 0.0f;
@@ -212,19 +269,26 @@ binary_sensor:
                   id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
                   id(garage_door_cover).publish_state();
                   id(shaft_steps).publish_state(0);
+                  id(was_opening) = true;
 
-# 2. OPEN REED (GPIO 2)
+  # 2. OPEN REED (GPIO 2)
   - platform: gpio
     name: "Garage Door Open Status"
     id: door_open_reed
-    device_class: opening
+    device_class: garage_door
     pin:
       number: 2
       mode: INPUT_PULLUP
       inverted: true
     on_press:
       then:
-        - script.execute: sync_open_position
+        - lambda: |-
+                id(total_steps) = 25300.0f; 
+                id(garage_door_cover).position = 1.0f;
+                id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
+                id(garage_door_cover).publish_state();
+                id(shaft_steps).publish_state(25300.0f);
+                id(was_opening) = false;
 
   # 3. IR BEAM (GPIO 4)
   - platform: gpio
@@ -236,61 +300,50 @@ binary_sensor:
       mode: INPUT_PULLUP
 
 script:
+  - id: pulse_motor
+    mode: queued
+    parameters:
+      count: int
+    then:
+      - repeat:
+          count: !lambda "return count;"
+          then:
+            - homeassistant.service: {service: switch.turn_on, data: {entity_id: "switch.garage_door"}}
+            - delay: 1000ms
+
   - id: drive_to_position
     mode: restart
     parameters:
       target_pos: float
     then:
       - lambda: |-
-          float max_peak = 24500.0f; // Use your observed linear max steps
+          float max_peak = 25300.0f;
           float target_steps = target_pos * max_peak;
           float current_steps = id(shaft_steps).state;
-          
-          // 1. Check if we are already there (2% tolerance)
           if (std::abs(current_steps - target_steps) < (max_peak * 0.02f)) return;
 
-          // 2. Decide direction and trigger call
           auto call = id(garage_door_cover).make_call();
-          if (target_steps > current_steps) {
-            call.set_command_open();
-          } else {
-            call.set_command_close();
-          }
+          if (target_steps > current_steps) call.set_command_open();
+          else call.set_command_close();
           call.perform();
-      
       - wait_until:
           condition:
             lambda: |-
-              float max_peak = 24500.0f;
+              float max_peak = 25300.0f;
               float target_steps = target_pos * max_peak;
               float current_steps = id(shaft_steps).state;
-              float offset = max_peak * 0.03f; // 3% lead time for braking
+              float offset = max_peak * 0.00f; // 0% braking
+
+              // Stop waiting if the cover becomes IDLE (someone hit stop)
+              if (id(garage_door_cover).current_operation == COVER_OPERATION_IDLE) return true;
 
               if (id(garage_door_cover).current_operation == COVER_OPERATION_OPENING) {
                 return (current_steps >= (target_steps - offset));
-              } else if (id(garage_door_cover).current_operation == COVER_OPERATION_CLOSING) {
+              } else {
                 return (current_steps <= (target_steps + offset));
               }
-              return false;
           timeout: 25s
-
       - cover.stop: garage_door_cover
-  
-  - id: sync_open_position
-    mode: single  # This ignores new triggers while the delay is active
-    then:
-      - if:
-          condition:
-            lambda: 'return !id(ignore_open_reed);'
-          then:
-            - lambda: |-
-                id(total_steps) = 24500.0f; 
-                id(garage_door_cover).position = 1.0f;
-                id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
-                id(garage_door_cover).publish_state();
-                id(shaft_steps).publish_state(24500.0f);
-            - logger.log: "Open Reed Sync successful. Locking out for 2s..."
-            - delay: 2s
 
 cover:
   - platform: template
@@ -298,71 +351,76 @@ cover:
     id: garage_door_cover
     device_class: garage
     has_position: true
-
     lambda: |-
-      if (id(door_closed_reed).state) return 0.0f;
+      if (!id(door_closed_reed).state) return 0.0f;
       if (id(door_open_reed).state) return 1.0f;
-      float max_steps = 24500.0f; 
-      return clamp(id(shaft_steps).state / max_steps, 0.0f, 1.0f);
+      float raw_pos = id(total_steps) / 25300.0f;
+      return clamp(raw_pos, 0.0f, 1.0f);
 
     position_action:
-      - script.execute:
-          id: drive_to_position
-          target_pos: !lambda "return pos;"
+      then:
+        - script.execute:
+            id: drive_to_position
+            target_pos: !lambda "return pos;"
 
     open_action:
-      - if:
-          condition: { lambda: 'return id(garage_door_cover).position < 0.99f;' }
-          then:
-            - lambda: |-
-                id(manual_override) = true;
-                id(garage_door_cover).current_operation = COVER_OPERATION_OPENING;
-                id(garage_door_cover).publish_state();
-            - if:
-                condition: { lambda: 'return id(motor_direction).state == "opening";' }
-                then: { homeassistant.service: {service: script.garage_triple_pulse} }
-                else: { homeassistant.service: {service: switch.turn_on, data: {entity_id: "switch.garage_door"}} }
-            - delay: 3s
-            - lambda: 'id(manual_override) = false;'
+      - lambda: |-
+          // 1. If already opening, do nothing
+          if (id(garage_door_cover).current_operation == COVER_OPERATION_OPENING) return;
+          
+          id(manual_override) = true;
+
+          // 2. If closing, we must STOP first
+          if (id(garage_door_cover).current_operation == COVER_OPERATION_CLOSING) {
+            id(pulse_motor).execute(1); 
+            // We don't set IDLE here because we want the UI to transition straight to Opening
+          }
+
+          id(garage_door_cover).current_operation = COVER_OPERATION_OPENING;
+          id(garage_door_cover).publish_state(); 
+          
+          // 3. Determine pulses to move Up
+          int pulses = (!id(door_closed_reed).state) ? 1 : (id(was_opening) ? 3 : 1);
+          id(was_opening) = true;
+          id(pulse_motor).execute(pulses);
+      - delay: 2s 
+      - lambda: 'id(manual_override) = false;'
 
     close_action:
-      - if:
-          condition: { lambda: 'return id(garage_door_cover).position > 0.01f;' }
-          then:
-            - lambda: |-
-                id(manual_override) = true;
-                id(ignore_open_reed) = true; 
-                id(garage_door_cover).current_operation = COVER_OPERATION_CLOSING;
-                id(garage_door_cover).publish_state();
-            - if:
-                condition:
-                  # Force single pulse if at the top to prevent 'move up then down' jitter
-                  lambda: 'return id(door_open_reed).state;'
-                then:
-                  - homeassistant.service: {service: switch.turn_on, data: {entity_id: "switch.garage_door"}}
-                else:
-                  - if:
-                      condition: { lambda: 'return id(motor_direction).state == "closing";' }
-                      then: { homeassistant.service: {service: script.garage_triple_pulse} }
-                      else: { homeassistant.service: {service: switch.turn_on, data: {entity_id: "switch.garage_door"}} }
-            - delay: 3s
-            - lambda: |-
-                id(manual_override) = false;
-                id(ignore_open_reed) = false;
+      - lambda: |-
+          // 1. If already closing, do nothing
+          if (id(garage_door_cover).current_operation == COVER_OPERATION_CLOSING) return;
+
+          id(manual_override) = true; 
+          id(ignore_open_reed) = true;
+
+          // 2. If opening, we must STOP first
+          if (id(garage_door_cover).current_operation == COVER_OPERATION_OPENING) {
+            id(pulse_motor).execute(1);
+          }
+
+          id(garage_door_cover).current_operation = COVER_OPERATION_CLOSING;
+          id(garage_door_cover).publish_state();
+
+          // 3. Determine pulses to move Down
+          int pulses = (id(door_open_reed).state) ? 1 : (!id(was_opening) ? 3 : 1);
+          id(was_opening) = false;
+          id(pulse_motor).execute(pulses);
+      - delay: 3s 
+      - lambda: |-
+          id(manual_override) = false;
+          id(ignore_open_reed) = false;
 
     stop_action:
-      - if:
-          condition: { lambda: 'return id(garage_door_cover).current_operation != COVER_OPERATION_IDLE;' }
-          then:
-            - lambda: |-
-                id(manual_override) = true;
-                id(coasting_lock) = true; // LOCK THE SENSOR
-                id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
-                id(garage_door_cover).publish_state();
-            - homeassistant.service: { service: switch.turn_on, data: { entity_id: "switch.garage_door" } }
-            - delay: 2s
-            - lambda: |-
-                id(manual_override) = false;
-                id(coasting_lock) = false; // RELEASE THE SENSOR
-
-captive_portal:
+      - lambda: |-
+          if (id(garage_door_cover).current_operation != COVER_OPERATION_IDLE) {
+            id(manual_override) = true;
+            id(coasting_lock) = true;
+            id(garage_door_cover).current_operation = COVER_OPERATION_IDLE;
+            id(garage_door_cover).publish_state();
+            id(pulse_motor).execute(1);
+          }
+      - delay: 2s 
+      - lambda: |-
+          id(manual_override) = false;
+          id(coasting_lock) = false;
